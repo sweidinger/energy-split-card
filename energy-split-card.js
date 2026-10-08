@@ -10,7 +10,7 @@
  * MIT License
  */
 
-const CARD_VERSION = "1.0.0";
+const CARD_VERSION = "1.0.1";
 
 const DEFAULT_COLORS = [
   "var(--energy-gas-color, #8e021b)",
@@ -109,7 +109,7 @@ class EnergySplitCard extends HTMLElement {
   }
 
   get _t() {
-    const lang = (this._hass?.locale?.language || this._hass?.language || "en").slice(0, 2);
+    const lang = this._lang.slice(0, 2);
     return T[lang] || T.en;
   }
 
@@ -268,7 +268,14 @@ class EnergySplitCard extends HTMLElement {
   // ---- formatting ---------------------------------------------------------
 
   get _lang() {
-    return this._hass?.locale?.language || this._hass?.language || "en";
+    return this._hass?.language || this._hass?.locale?.language || "en";
+  }
+
+  _hour12() {
+    const tf = this._hass?.locale?.time_format;
+    if (tf === "24") return false;
+    if (tf === "12") return true;
+    return undefined;
   }
 
   _num(v, digits = 2) {
@@ -297,6 +304,7 @@ class EnergySplitCard extends HTMLElement {
         : long
         ? { month: "long", year: "numeric" }
         : { month: "short" };
+    if (this._period === "hour" && this._hour12() !== undefined) opts.hour12 = this._hour12();
     try {
       return new Intl.DateTimeFormat(this._lang, { ...opts, timeZone: this._tz() }).format(new Date(t));
     } catch (e) {
@@ -306,8 +314,12 @@ class EnergySplitCard extends HTMLElement {
 
   _unit() {
     if (this._config.unit) return this._config.unit;
-    const st = this._hass?.states[this._series[0].entity];
-    return st?.attributes?.unit_of_measurement || "";
+    const ids = [...this._series.map((s) => s.entity), this._config.total_entity].filter(Boolean);
+    for (const id of ids) {
+      const u = this._hass?.states[id]?.attributes?.unit_of_measurement;
+      if (u) return u;
+    }
+    return "";
   }
 
   _price() {
@@ -410,7 +422,9 @@ class EnergySplitCard extends HTMLElement {
       s += `<text class="tick" x="${m.l - 6}" y="${yy}" text-anchor="end" dominant-baseline="middle">${this._num(v, step < 1 ? 1 : 0)}</text>`;
     }
     s += `<text class="tick" x="${m.l - 6}" y="${m.t - 2}" text-anchor="end">${unit}</text>`;
-    const labelEvery = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(iw / 46))));
+    const maxChars = Math.max(...rows.map((r) => this._label(r.t).length), 1);
+    const perLabel = maxChars * 6.5 + 12;
+    const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / perLabel))));
     rows.forEach((r, idx) => {
       const cx = m.l + slot * idx + slot / 2;
       const x = (cx - bw / 2).toFixed(1);
