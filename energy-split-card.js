@@ -2,15 +2,16 @@
  * Energy Split Card for Home Assistant
  * https://github.com/sweidinger/energy-split-card
  *
- * Stacked bar chart for any set of long-term statistics (gas, electricity,
- * water, heat ...), following the period of the native `energy-date-selection`
- * card – just like the graphs on the Energy dashboard, but with sources you
- * choose yourself. Optional total statistic adds an "untracked" segment.
+ * Stacked bar chart and totals table for any set of long-term statistics
+ * (gas, electricity, water, heat ...), following the period of the native
+ * `energy-date-selection` card – styled like the Energy dashboard, but with
+ * sources you choose yourself. Optional total statistic adds an "untracked"
+ * segment, optional cost statistic distributes real costs per source.
  *
  * MIT License
  */
 
-const CARD_VERSION = "1.0.2";
+const CARD_VERSION = "1.1.0";
 
 const DEFAULT_COLORS = [
   "var(--energy-gas-color, #8e021b)",
@@ -20,16 +21,17 @@ const DEFAULT_COLORS = [
   "#9c27b0",
   "#795548",
 ];
-const UNTRACKED_COLOR = "var(--secondary-text-color, #9e9e9e)";
+const UNTRACKED_COLOR = "var(--state-unavailable-color, #9e9e9e)";
 
 const T = {
   de: {
     untracked: "Nicht zugeordnet",
     total: "Gesamt",
     source: "Quelle",
-    energy: "Verbrauch",
+    energy: "Energie",
     cost: "Kosten",
     share: "Anteil",
+    sums: "Summen",
     noData: "Keine Daten in diesem Zeitraum",
     noSelector:
       "Keine Datumsauswahl gefunden – zeige heute. Füge eine Karte vom Typ energy-date-selection hinzu.",
@@ -42,6 +44,7 @@ const T = {
     energy: "Energy",
     cost: "Cost",
     share: "Share",
+    sums: "Totals",
     noData: "No data for this period",
     noSelector:
       "No date selection found – showing today. Add an energy-date-selection card.",
@@ -62,6 +65,7 @@ class EnergySplitCard extends HTMLElement {
     this._width = 0;
     this._fetchSeq = 0;
     this._fallback = false;
+    this._hidden = new Set();
   }
 
   static getStubConfig() {
@@ -81,18 +85,19 @@ class EnergySplitCard extends HTMLElement {
     if (config.collection_key && !String(config.collection_key).startsWith("energy_")) {
       throw new Error("`collection_key` muss mit `energy_` beginnen.");
     }
-    this._config = {
-      chart_height: 240,
-      show_table: true,
-      ...config,
-    };
+    const display = config.display || (config.show_table === false ? "chart" : "both");
+    if (!["both", "chart", "table"].includes(display)) {
+      throw new Error("`display` muss both, chart oder table sein.");
+    }
+    this._config = { chart_height: 300, show_share: false, ...config, display };
     this._series = config.series.map((s, i) => ({
       entity: s.entity,
       name: s.name || s.entity,
       color: s.color || DEFAULT_COLORS[i % DEFAULT_COLORS.length],
     }));
     this._data = null;
-    if (this._hass) this._fetch();
+    this.shadowRoot.innerHTML = "";
+    if (this._hass && this._start) this._fetch();
     this._render();
   }
 
@@ -100,17 +105,11 @@ class EnergySplitCard extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (first) this._connect();
-    // Price changes only affect the table.
     const price = this._config?.price_entity ? hass.states[this._config.price_entity]?.state : null;
     if (price !== this._lastPrice) {
       this._lastPrice = price;
       this._render();
     }
-  }
-
-  get _t() {
-    const lang = this._lang.slice(0, 2);
-    return T[lang] || T.en;
   }
 
   connectedCallback() {
@@ -124,10 +123,12 @@ class EnergySplitCard extends HTMLElement {
         }
       });
     }
-    requestAnimationFrame(() => {
-      const box = this.shadowRoot.querySelector(".chart");
-      if (box) this._ro.observe(box);
-    });
+    requestAnimationFrame(() => this._observe());
+  }
+
+  _observe() {
+    const box = this.shadowRoot.querySelector(".chart");
+    if (box && this._ro) this._ro.observe(box);
   }
 
   disconnectedCallback() {
@@ -144,7 +145,7 @@ class EnergySplitCard extends HTMLElement {
   }
 
   getCardSize() {
-    return 7;
+    return this._config?.display === "table" ? 3 : 7;
   }
 
   getGridOptions() {
@@ -153,7 +154,7 @@ class EnergySplitCard extends HTMLElement {
 
   // ---- period source -------------------------------------------------------
 
-  _collectionKeys() {
+  _collections() {
     const conn = this._hass.connection;
     const keys = [];
     if (this._config.collection_key) keys.push("_" + this._config.collection_key);
@@ -163,8 +164,8 @@ class EnergySplitCard extends HTMLElement {
   }
 
   _connect(attempt = 0) {
-    if (!this._hass || this._unsub) return;
-    const found = this._collectionKeys()[0];
+    if (!this._hass || this._unsub || !this._config) return;
+    const found = this._collections()[0];
     if (found) {
       this._fallback = false;
       this._unsub = found.subscribe((d) => this._setPeriod(d.start, d.end));
@@ -174,7 +175,6 @@ class EnergySplitCard extends HTMLElement {
       this._pollTimer = setTimeout(() => this._connect(attempt + 1), 200);
       return;
     }
-    // No selector on the page: show today.
     this._fallback = true;
     const s = new Date();
     s.setHours(0, 0, 0, 0);
@@ -187,7 +187,7 @@ class EnergySplitCard extends HTMLElement {
   _setPeriod(start, end) {
     if (!start) return;
     const s = new Date(start);
-    let e = end ? new Date(end) : new Date(s.getTime() + 86400000 - 1);
+    const e = end ? new Date(end) : new Date(s.getTime() + 86400000 - 1);
     this._start = s;
     this._end = e;
     const days = (e - s) / 86400000;
@@ -202,8 +202,7 @@ class EnergySplitCard extends HTMLElement {
     const seq = ++this._fetchSeq;
     const ids = this._series.map((s) => s.entity);
     if (this._config.total_entity) ids.push(this._config.total_entity);
-    this._loading = true;
-    this._render();
+    if (this._config.cost_entity) ids.push(this._config.cost_entity);
     let res = {};
     try {
       res = await this._hass.callWS({
@@ -218,7 +217,6 @@ class EnergySplitCard extends HTMLElement {
       console.error("energy-split-card: statistics query failed", err);
     }
     if (seq !== this._fetchSeq) return;
-    this._loading = false;
     this._data = this._process(res || {});
     this._render();
   }
@@ -241,28 +239,44 @@ class EnergySplitCard extends HTMLElement {
       const m = new Map();
       for (const row of res[id] || []) {
         const t = typeof row.start === "number" ? row.start : new Date(row.start).getTime();
-        if (row.change != null) m.set(t, Math.max(0, row.change));
+        if (row.change != null) m.set(t, row.change);
       }
       return m;
     };
     const seriesMaps = this._series.map((s) => toMap(s.entity));
     const totalMap = this._config.total_entity ? toMap(this._config.total_entity) : null;
+    const costMap = this._config.cost_entity ? toMap(this._config.cost_entity) : null;
 
     const set = new Set(this._buckets());
     for (const m of [...seriesMaps, ...(totalMap ? [totalMap] : [])]) for (const t of m.keys()) set.add(t);
     const buckets = [...set].sort((a, b) => a - b);
 
     const rows = buckets.map((t) => {
-      const values = seriesMaps.map((m) => m.get(t) || 0);
+      const values = seriesMaps.map((m) => Math.max(0, m.get(t) || 0));
       const sum = values.reduce((a, b) => a + b, 0);
-      let untracked = 0;
-      if (totalMap) untracked = Math.max(0, (totalMap.get(t) || 0) - sum);
-      return { t, values, untracked, stack: sum + untracked };
+      const total = totalMap ? Math.max(0, totalMap.get(t) || 0) : sum;
+      const untracked = totalMap ? Math.max(0, total - sum) : 0;
+      const cost = costMap ? Math.max(0, costMap.get(t) || 0) : null;
+      return { t, values, untracked, total: Math.max(total, sum), cost };
     });
     const totals = this._series.map((_, i) => rows.reduce((a, r) => a + r.values[i], 0));
     const untrackedTotal = rows.reduce((a, r) => a + r.untracked, 0);
-    const hasData = rows.some((r) => r.stack > 0);
-    return { rows, totals, untrackedTotal, hasData };
+
+    // Real costs: distribute each bucket's cost proportionally to its energy.
+    let costs = null;
+    if (costMap) {
+      costs = this._series.map(() => 0);
+      let untrackedCost = 0;
+      for (const r of rows) {
+        if (!(r.cost > 0) || !(r.total > 0)) continue;
+        const perUnit = r.cost / r.total;
+        r.values.forEach((v, i) => (costs[i] += v * perUnit));
+        untrackedCost += r.untracked * perUnit;
+      }
+      costs.untracked = untrackedCost;
+    }
+    const hasData = rows.some((r) => r.total > 0);
+    return { rows, totals, untrackedTotal, costs, hasData };
   }
 
   // ---- formatting ---------------------------------------------------------
@@ -271,15 +285,12 @@ class EnergySplitCard extends HTMLElement {
     return this._hass?.language || this._hass?.locale?.language || "en";
   }
 
-  _hour12() {
-    const tf = this._hass?.locale?.time_format;
-    if (tf === "24") return false;
-    if (tf === "12") return true;
-    return undefined;
+  get _t() {
+    return T[this._lang.slice(0, 2)] || T.en;
   }
 
-  _num(v, digits = 2) {
-    return new Intl.NumberFormat(this._lang, { maximumFractionDigits: digits, minimumFractionDigits: 0 }).format(v);
+  _num(v, min = 0, max = 2) {
+    return new Intl.NumberFormat(this._lang, { minimumFractionDigits: min, maximumFractionDigits: max }).format(v);
   }
 
   _money(v) {
@@ -287,29 +298,58 @@ class EnergySplitCard extends HTMLElement {
     return new Intl.NumberFormat(this._lang, { style: "currency", currency: cur }).format(v);
   }
 
-  _tz() {
-    return this._hass?.config?.time_zone;
-  }
-
-  _label(t, long = false) {
-    const opts =
-      this._period === "hour"
-        ? long
-          ? { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }
-          : { hour: "2-digit", minute: "2-digit" }
-        : this._period === "day"
-        ? long
-          ? { weekday: "short", day: "numeric", month: "short", year: "numeric" }
-          : { day: "numeric", month: "numeric" }
-        : long
-        ? { month: "long", year: "numeric" }
-        : { month: "short" };
-    if (this._period === "hour" && this._hour12() !== undefined) opts.hour12 = this._hour12();
+  _fmt(t, opts) {
+    const tf = this._hass?.locale?.time_format;
+    if (opts.hour && (tf === "24" || tf === "12")) opts = { ...opts, hour12: tf === "12" };
     try {
-      return new Intl.DateTimeFormat(this._lang, { ...opts, timeZone: this._tz() }).format(new Date(t));
+      return new Intl.DateTimeFormat(this._lang, { ...opts, timeZone: this._hass?.config?.time_zone }).format(new Date(t));
     } catch (e) {
       return new Intl.DateTimeFormat(this._lang, opts).format(new Date(t));
     }
+  }
+
+  _longLabel(t) {
+    if (this._period === "hour") {
+      const end = t + 3600000;
+      return `${this._fmt(t, { weekday: "short", day: "numeric", month: "short" })}, ${this._fmt(t, {
+        hour: "2-digit",
+        minute: "2-digit",
+      })} – ${this._fmt(end, { hour: "2-digit", minute: "2-digit" })}`;
+    }
+    if (this._period === "day") return this._fmt(t, { weekday: "short", day: "numeric", month: "long", year: "numeric" });
+    return this._fmt(t, { month: "long", year: "numeric" });
+  }
+
+  // Axis labels like the Energy dashboard: a bold label at the start of each
+  // larger unit (day / month / year), plain labels in between.
+  _axisLabel(t) {
+    const d = new Date(t);
+    if (this._period === "hour") {
+      if (d.getHours() === 0) return { text: this._fmt(t, { day: "numeric", month: "short" }), bold: true };
+      return { text: this._fmt(t, { hour: "numeric", minute: "2-digit" }), bold: false };
+    }
+    if (this._period === "day") {
+      if (d.getDate() === 1) return { text: this._fmt(t, { month: "short" }), bold: true };
+      return { text: this._fmt(t, { day: "numeric", month: "short" }), bold: false };
+    }
+    if (d.getMonth() === 0) return { text: this._fmt(t, { year: "numeric" }), bold: true };
+    return { text: this._fmt(t, { month: "short" }), bold: false };
+  }
+
+  _labelStep(n, iw) {
+    const sample = this._axisLabel(this._data.rows[Math.min(1, n - 1)].t).text.length;
+    const maxLabels = Math.max(2, Math.floor(iw / (sample * 7 + 24)));
+    const steps =
+      this._period === "hour" ? [1, 2, 3, 4, 6, 12, 24] : this._period === "day" ? [1, 2, 7, 14] : [1, 2, 3, 6, 12];
+    return steps.find((s) => Math.ceil(n / s) <= maxLabels) || steps[steps.length - 1];
+  }
+
+  _isLabelSlot(t, idx, step) {
+    if (step === 1) return true;
+    const d = new Date(t);
+    if (this._period === "hour") return d.getHours() % step === 0;
+    if (this._period === "day") return idx % step === 0;
+    return d.getMonth() % step === 0;
   }
 
   _unit() {
@@ -330,56 +370,86 @@ class EnergySplitCard extends HTMLElement {
 
   // ---- rendering ----------------------------------------------------------
 
+  _ensureDom() {
+    const root = this.shadowRoot;
+    if (root.querySelector("ha-card")) return;
+    const disp = this._config.display;
+    root.innerHTML = `
+      <style>
+        :host { display: block; }
+        ha-card { height: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
+        .header { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+                  padding: 16px 16px 0; min-height: 40px; }
+        .title { font-size: var(--ha-card-header-font-size, 24px); font-weight: 400; line-height: 1.3;
+                 color: var(--ha-card-header-color, var(--primary-text-color)); letter-spacing: -0.012em; }
+        .badge { border: 1px solid var(--divider-color, rgba(127,127,127,.3)); border-radius: 8px;
+                 padding: 4px 10px; font-size: 14px; font-weight: 500; white-space: nowrap;
+                 color: var(--primary-text-color); font-variant-numeric: tabular-nums; }
+        .badge:empty { display: none; }
+        .content { padding: 8px 16px 16px; }
+        .chart { position: relative; width: 100%; min-height: 60px; }
+        .msg { color: var(--secondary-text-color); font-size: 0.9em; padding: 8px 0; }
+        svg { display: block; overflow: visible; }
+        .tick { fill: var(--secondary-text-color); font-size: 12px; font-variant-numeric: tabular-nums; }
+        .tick.bold { fill: var(--primary-text-color); font-weight: 700; }
+        .grid { stroke: var(--divider-color, rgba(127,127,127,.2)); stroke-width: 1; }
+        .hit { fill: transparent; }
+        .hit:hover { fill: var(--primary-text-color); fill-opacity: .05; }
+        .tip { position: absolute; pointer-events: none; background: var(--card-background-color, #fff);
+               color: var(--primary-text-color); border: 1px solid var(--divider-color, #ccc);
+               border-radius: 8px; padding: 8px 10px; font-size: 13px; line-height: 1.6;
+               box-shadow: 0 2px 10px rgba(0,0,0,.25); white-space: nowrap; z-index: 2;
+               font-variant-numeric: tabular-nums; }
+        .tip b { display: block; margin-bottom: 2px; font-weight: 500; }
+        .tdot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+        table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+        th { text-align: left; font-weight: 500; font-size: 14px; color: var(--primary-text-color);
+             padding: 0 8px 12px; border-bottom: 1px solid var(--divider-color, #ddd); }
+        td { padding: 14px 8px; border-bottom: 1px solid var(--divider-color, #eee); color: var(--primary-text-color); font-size: 14px; }
+        th.n, td.n { text-align: right; }
+        td.sw { width: 52px; padding-right: 0; }
+        .swatch { display: block; width: 44px; height: 22px; border-radius: 6px; box-sizing: border-box; border: 1.5px solid; }
+        tr.total td { font-weight: 500; border-bottom: 0; }
+        tr.off td { opacity: .4; }
+        tr.row { cursor: pointer; }
+      </style>
+      <ha-card>
+        <div class="header"><span class="title"></span><span class="badge"></span></div>
+        <div class="content">
+          ${disp !== "table" ? `<div class="chart"><div class="tip" hidden></div></div>` : ""}
+          ${disp !== "chart" ? `<div class="table"></div>` : ""}
+        </div>
+      </ha-card>`;
+    this._observe();
+  }
+
   _render() {
     if (!this._config) return;
+    this._ensureDom();
     const root = this.shadowRoot;
-    if (!root.querySelector("ha-card")) {
-      root.innerHTML = `
-        <style>
-          :host { display: block; }
-          ha-card { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-          .head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-          .title { font-size: 1.15em; font-weight: 500; color: var(--primary-text-color); }
-          .sum { color: var(--secondary-text-color); font-variant-numeric: tabular-nums; }
-          .chart { position: relative; width: 100%; min-height: 60px; }
-          .msg { color: var(--secondary-text-color); font-size: 0.9em; padding: 8px 0; }
-          svg { display: block; overflow: visible; }
-          .tick { fill: var(--secondary-text-color); font-size: 11px; font-variant-numeric: tabular-nums; }
-          .grid { stroke: var(--divider-color, rgba(127,127,127,.25)); stroke-width: 1; }
-          .hit { fill: transparent; cursor: default; }
-          .hit:hover { fill: var(--primary-text-color); fill-opacity: .06; }
-          .tip { position: absolute; pointer-events: none; background: var(--card-background-color, #fff);
-                 color: var(--primary-text-color); border: 1px solid var(--divider-color, #ccc);
-                 border-radius: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.5;
-                 box-shadow: 0 2px 8px rgba(0,0,0,.18); white-space: nowrap; z-index: 2;
-                 font-variant-numeric: tabular-nums; }
-          .tip b { display: block; margin-bottom: 2px; }
-          .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
-          table { width: 100%; border-collapse: collapse; font-size: 0.95em; font-variant-numeric: tabular-nums; }
-          th { text-align: left; font-weight: 500; color: var(--secondary-text-color); font-size: 0.85em; padding: 4px 6px; border-bottom: 1px solid var(--divider-color, #ddd); }
-          td { padding: 6px; border-bottom: 1px solid var(--divider-color, #eee); color: var(--primary-text-color); }
-          th.n, td.n { text-align: right; }
-          tr.total td { font-weight: 600; border-bottom: 0; }
-          tr.off td { opacity: .45; }
-          tr.row { cursor: pointer; }
-        </style>
-        <ha-card>
-          <div class="head"><span class="title"></span><span class="sum"></span></div>
-          <div class="chart"><div class="tip" hidden></div></div>
-          <div class="table"></div>
-        </ha-card>`;
-      this._hidden = new Set();
-    }
-    root.querySelector(".title").textContent = this._config.title || "";
     const t = this._t;
+    const disp = this._config.display;
+    root.querySelector(".title").textContent =
+      this._config.title ?? (disp === "table" ? t.sums : "");
+    const badge = root.querySelector(".badge");
     const d = this._data;
-    const sumEl = root.querySelector(".sum");
-    if (d && d.hasData) {
-      const tot = d.totals.reduce((a, b) => a + b, 0) + d.untrackedTotal;
-      sumEl.textContent = `${t.total}: ${this._num(tot)} ${this._unit()}`;
-    } else sumEl.textContent = "";
+    if (disp !== "table" && d && d.hasData) {
+      const tot = this._visibleTotal();
+      badge.textContent = `${this._num(tot, 0, 2)} ${this._unit()}`;
+    } else badge.textContent = "";
     this._renderChart();
     this._renderTable();
+  }
+
+  _visibleTotal() {
+    const d = this._data;
+    return d.totals.reduce((a, v, i) => a + (this._hidden.has(i) ? 0 : v), 0) + (this._hidden.has("u") ? 0 : d.untrackedTotal);
+  }
+
+  _parts(r) {
+    const parts = r.values.map((v, i) => ({ v: this._hidden.has(i) ? 0 : v, c: this._series[i].color }));
+    if (this._config.total_entity && !this._hidden.has("u")) parts.push({ v: r.untracked, c: UNTRACKED_COLOR });
+    return parts;
   }
 
   _renderChart() {
@@ -398,52 +468,55 @@ class EnergySplitCard extends HTMLElement {
       box.insertAdjacentHTML("beforeend", `<div class="msg">${t.noData}</div>`);
       return;
     }
-    const W = this._width || box.clientWidth || 400;
+    const W = this._width || box.clientWidth || 600;
     const H = this._config.chart_height;
-    const m = { l: 44, r: 6, t: 20, b: 22 };
+    const unit = this._unit();
+    const rows = d.rows;
+    const maxV = Math.max(...rows.map((r) => this._parts(r).reduce((a, p) => a + p.v, 0)), 0);
+    const { max, step, decimals } = niceScale(maxV);
+    const yLabelW = Math.max(...[0, max].map((v) => this._num(v, decimals, decimals).length)) * 7 + 10;
+    const m = { l: Math.max(36, yLabelW), r: 8, t: 22, b: 26 };
     const iw = Math.max(10, W - m.l - m.r);
     const ih = H - m.t - m.b;
-    const hidden = this._hidden;
-    const rows = d.rows;
-    const stackOf = (r) =>
-      r.values.reduce((a, v, i) => a + (hidden.has(i) ? 0 : v), 0) + (hidden.has("u") ? 0 : r.untracked);
-    const maxV = Math.max(...rows.map(stackOf), 0);
-    const { max, step } = niceScale(maxV);
     const y = (v) => m.t + ih - (v / max) * ih;
     const n = rows.length;
     const slot = iw / n;
-    const bw = Math.max(1, Math.min(slot * 0.72, 48));
-    const unit = this._unit();
+    const bw = Math.max(1, Math.min(slot * 0.7, 56));
 
     let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img">`;
-    for (let v = 0; v <= max + 1e-9; v += step) {
+    for (let v = 0; v <= max + step / 1000; v += step) {
       const yy = y(v).toFixed(1);
       s += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}"/>`;
-      s += `<text class="tick" x="${m.l - 6}" y="${yy}" text-anchor="end" dominant-baseline="middle">${this._num(v, step < 1 ? 1 : 0)}</text>`;
+      s += `<text class="tick" x="${m.l - 8}" y="${yy}" text-anchor="end" dominant-baseline="middle">${this._num(v, decimals, decimals)}</text>`;
     }
-    s += `<text class="tick" x="${m.l - 6}" y="${m.t - 10}" text-anchor="end">${unit}</text>`;
-    const maxChars = Math.max(...rows.map((r) => this._label(r.t).length), 1);
-    const perLabel = maxChars * 6.5 + 12;
-    const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / perLabel))));
+    s += `<text class="tick" x="${m.l}" y="${m.t - 10}" text-anchor="start">${esc(unit)}</text>`;
+
+    const lstep = this._labelStep(n, iw);
     rows.forEach((r, idx) => {
-      const cx = m.l + slot * idx + slot / 2;
-      const x = (cx - bw / 2).toFixed(1);
+      const x0 = m.l + slot * idx;
+      if (this._isLabelSlot(r.t, idx, lstep)) {
+        const lab = this._axisLabel(r.t);
+        s += `<line class="grid" x1="${x0.toFixed(1)}" x2="${x0.toFixed(1)}" y1="${m.t}" y2="${m.t + ih}"/>`;
+        s += `<text class="tick${lab.bold ? " bold" : ""}" x="${x0.toFixed(1)}" y="${H - 6}" text-anchor="${idx === 0 ? "start" : "middle"}">${esc(lab.text)}</text>`;
+      }
+    });
+    s += `<line class="grid" x1="${(m.l + iw).toFixed(1)}" x2="${(m.l + iw).toFixed(1)}" y1="${m.t}" y2="${m.t + ih}"/>`;
+
+    rows.forEach((r, idx) => {
+      const x = m.l + slot * idx + (slot - bw) / 2;
       let acc = 0;
-      const parts = r.values.map((v, i) => ({ v: hidden.has(i) ? 0 : v, c: this._series[i].color }));
-      if (this._config.total_entity && !hidden.has("u")) parts.push({ v: r.untracked, c: UNTRACKED_COLOR });
-      const visible = parts.filter((p) => p.v > 0);
+      const visible = this._parts(r).filter((p) => p.v > 0);
       visible.forEach((p, k) => {
         const y1 = y(acc + p.v);
         const h = Math.max(0, y(acc) - y1);
         const top = k === visible.length - 1;
-        s += top && h > 3
-          ? `<path d="${roundTop(+x, y1, bw, h, Math.min(3, bw / 3))}" fill="${p.c}"/>`
-          : `<rect x="${x}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${p.c}"/>`;
+        const style = `fill:${p.c};fill-opacity:.5;stroke:${p.c};stroke-width:1.5`;
+        s += top && h > 4
+          ? `<path d="${roundTop(x, y1, bw, h, Math.min(4, bw / 4))}" style="${style}"/>`
+          : `<rect x="${x.toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" style="${style}"/>`;
         acc += p.v;
       });
       s += `<rect class="hit" data-i="${idx}" x="${(m.l + slot * idx).toFixed(1)}" y="${m.t}" width="${slot.toFixed(1)}" height="${ih}"/>`;
-      if (idx % labelEvery === 0)
-        s += `<text class="tick" x="${cx.toFixed(1)}" y="${H - 6}" text-anchor="middle">${this._label(r.t)}</text>`;
     });
     s += `</svg>`;
     box.insertAdjacentHTML("afterbegin", s);
@@ -456,20 +529,20 @@ class EnergySplitCard extends HTMLElement {
         return;
       }
       const r = rows[+hit.dataset.i];
-      let html = `<b>${this._label(r.t, true)}</b>`;
+      let html = `<b>${esc(this._longLabel(r.t))}</b>`;
       this._series.forEach((se, i) => {
-        if (hidden.has(i)) return;
-        html += `<div><span class="dot" style="background:${se.color}"></span>${esc(se.name)}: ${this._num(r.values[i])} ${unit}</div>`;
+        if (this._hidden.has(i)) return;
+        html += `<div><span class="tdot" style="background:${se.color}"></span>${esc(se.name)}: ${this._num(r.values[i])} ${esc(unit)}</div>`;
       });
-      if (this._config.total_entity && !hidden.has("u") && r.untracked > 0)
-        html += `<div><span class="dot" style="background:${UNTRACKED_COLOR}"></span>${t.untracked}: ${this._num(r.untracked)} ${unit}</div>`;
+      if (this._config.total_entity && !this._hidden.has("u") && r.untracked > 0)
+        html += `<div><span class="tdot" style="background:${UNTRACKED_COLOR}"></span>${t.untracked}: ${this._num(r.untracked)} ${esc(unit)}</div>`;
       tip.innerHTML = html;
       tip.hidden = false;
       const rect = box.getBoundingClientRect();
-      let left = ev.clientX - rect.left + 12;
-      if (left + tip.offsetWidth > rect.width) left = ev.clientX - rect.left - tip.offsetWidth - 12;
+      let left = ev.clientX - rect.left + 14;
+      if (left + tip.offsetWidth > rect.width) left = ev.clientX - rect.left - tip.offsetWidth - 14;
       tip.style.left = `${Math.max(0, left)}px`;
-      tip.style.top = `${Math.max(0, ev.clientY - rect.top - tip.offsetHeight - 8)}px`;
+      tip.style.top = `${Math.max(0, ev.clientY - rect.top - tip.offsetHeight - 10)}px`;
     });
     svg.addEventListener("mouseleave", () => (tip.hidden = true));
   }
@@ -478,22 +551,38 @@ class EnergySplitCard extends HTMLElement {
     const el = this.shadowRoot.querySelector(".table");
     if (!el) return;
     const d = this._data;
-    if (!this._config.show_table || !d || !d.hasData) {
-      el.innerHTML = "";
+    const t = this._t;
+    if (!d || !d.hasData) {
+      el.innerHTML = this._config.display === "table" && d ? `<div class="msg">${t.noData}</div>` : "";
       return;
     }
-    const t = this._t;
     const unit = this._unit();
     const price = this._price();
-    const items = this._series.map((s, i) => ({ key: i, name: s.name, color: s.color, v: d.totals[i] }));
-    if (this._config.total_entity) items.push({ key: "u", name: t.untracked, color: UNTRACKED_COLOR, v: d.untrackedTotal });
-    const sum = items.reduce((a, it) => a + it.v, 0);
-    const costCol = price != null;
-    let h = `<table><thead><tr><th>${t.source}</th><th class="n">${t.energy}</th>${costCol ? `<th class="n">${t.cost}</th>` : ""}<th class="n">${t.share}</th></tr></thead><tbody>`;
+    const items = this._series.map((s, i) => ({ key: i, name: s.name, color: s.color, v: d.totals[i], c: d.costs ? d.costs[i] : null }));
+    if (this._config.total_entity)
+      items.push({ key: "u", name: t.untracked, color: UNTRACKED_COLOR, v: d.untrackedTotal, c: d.costs ? d.costs.untracked : null });
+    const costOf = (it) => (it.c != null ? it.c : price != null ? it.v * price : null);
+    const costCol = d.costs != null || price != null;
+    const shareCol = this._config.show_share;
+    const active = items.filter((it) => !this._hidden.has(it.key));
+    const sum = active.reduce((a, it) => a + it.v, 0);
+    const sumCost = active.reduce((a, it) => a + (costOf(it) || 0), 0);
+
+    let h = `<table><thead><tr><th></th><th>${t.source}</th><th class="n">${t.energy}</th>${
+      costCol ? `<th class="n">${t.cost}</th>` : ""
+    }${shareCol ? `<th class="n">${t.share}</th>` : ""}</tr></thead><tbody>`;
     for (const it of items) {
-      h += `<tr class="row${this._hidden.has(it.key) ? " off" : ""}" data-k="${it.key}"><td><span class="dot" style="background:${it.color}"></span>${esc(it.name)}</td><td class="n">${this._num(it.v)} ${unit}</td>${costCol ? `<td class="n">${this._money(it.v * price)}</td>` : ""}<td class="n">${sum > 0 ? this._num((it.v / sum) * 100, 1) : 0} %</td></tr>`;
+      h += `<tr class="row${this._hidden.has(it.key) ? " off" : ""}" data-k="${it.key}">
+        <td class="sw"><span class="swatch" style="background:${it.color};border-color:${it.color};background-color:color-mix(in srgb, ${it.color} 50%, transparent)"></span></td>
+        <td>${esc(it.name)}</td>
+        <td class="n">${this._num(it.v)} ${esc(unit)}</td>
+        ${costCol ? `<td class="n">${this._money(costOf(it) || 0)}</td>` : ""}
+        ${shareCol ? `<td class="n">${sum > 0 && !this._hidden.has(it.key) ? this._num((it.v / sum) * 100, 0, 1) : 0} %</td>` : ""}
+      </tr>`;
     }
-    h += `<tr class="total"><td>${t.total}</td><td class="n">${this._num(sum)} ${unit}</td>${costCol ? `<td class="n">${this._money(sum * price)}</td>` : ""}<td class="n"></td></tr></tbody></table>`;
+    h += `<tr class="total"><td></td><td>${esc(this._config.total_label || t.total)}</td><td class="n">${this._num(sum)} ${esc(unit)}</td>${
+      costCol ? `<td class="n">${this._money(sumCost)}</td>` : ""
+    }${shareCol ? `<td></td>` : ""}</tr></tbody></table>`;
     el.innerHTML = h;
     el.querySelectorAll("tr.row").forEach((tr) =>
       tr.addEventListener("click", () => {
@@ -507,16 +596,19 @@ class EnergySplitCard extends HTMLElement {
 }
 
 function niceScale(maxV) {
-  if (!(maxV > 0)) return { max: 1, step: 0.25 };
-  const raw = maxV / 4;
+  if (!(maxV > 0)) return { max: 1, step: 0.25, decimals: 2 };
+  const raw = maxV / 7;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
   const norm = raw / mag;
-  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
-  return { max: Math.ceil(maxV / step) * step, step };
+  const f = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10;
+  const step = f * mag;
+  const max = Math.ceil(maxV / step - 1e-9) * step;
+  const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9) + (f === 2.5 ? 1 : 0));
+  return { max: max || step, step, decimals };
 }
 
 function roundTop(x, y, w, h, r) {
-  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+  return `M${x.toFixed(1)},${(y + h).toFixed(1)}V${(y + r).toFixed(1)}Q${x.toFixed(1)},${y.toFixed(1)} ${(x + r).toFixed(1)},${y.toFixed(1)}H${(x + w - r).toFixed(1)}Q${(x + w).toFixed(1)},${y.toFixed(1)} ${(x + w).toFixed(1)},${(y + r).toFixed(1)}V${(y + h).toFixed(1)}Z`;
 }
 
 function esc(s) {
@@ -529,7 +621,7 @@ if (!customElements.get("energy-split-card")) {
   window.customCards.push({
     type: "energy-split-card",
     name: "Energy Split Card",
-    description: "Gestapelte Verbrauchsbalken für frei wählbare Statistiken, gesteuert über energy-date-selection.",
+    description: "Gestapelte Verbrauchsbalken und Summentabelle für frei wählbare Statistiken, gesteuert über energy-date-selection.",
     documentationURL: "https://github.com/sweidinger/energy-split-card",
   });
   console.info(`%c ENERGY-SPLIT-CARD %c ${CARD_VERSION} `, "background:#8e021b;color:#fff", "background:#444;color:#fff");
