@@ -10,7 +10,7 @@
  * MIT License
  */
 
-const CARD_VERSION = "1.0.1";
+const CARD_VERSION = "1.0.2";
 
 const DEFAULT_COLORS = [
   "var(--energy-gas-color, #8e021b)",
@@ -400,7 +400,7 @@ class EnergySplitCard extends HTMLElement {
     }
     const W = this._width || box.clientWidth || 400;
     const H = this._config.chart_height;
-    const m = { l: 44, r: 6, t: 8, b: 22 };
+    const m = { l: 44, r: 6, t: 20, b: 22 };
     const iw = Math.max(10, W - m.l - m.r);
     const ih = H - m.t - m.b;
     const hidden = this._hidden;
@@ -421,7 +421,7 @@ class EnergySplitCard extends HTMLElement {
       s += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}"/>`;
       s += `<text class="tick" x="${m.l - 6}" y="${yy}" text-anchor="end" dominant-baseline="middle">${this._num(v, step < 1 ? 1 : 0)}</text>`;
     }
-    s += `<text class="tick" x="${m.l - 6}" y="${m.t - 2}" text-anchor="end">${unit}</text>`;
+    s += `<text class="tick" x="${m.l - 6}" y="${m.t - 10}" text-anchor="end">${unit}</text>`;
     const maxChars = Math.max(...rows.map((r) => this._label(r.t).length), 1);
     const perLabel = maxChars * 6.5 + 12;
     const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(iw / perLabel))));
